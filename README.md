@@ -187,6 +187,8 @@ python build.py --clean
 
 # 自定义应用名和输出目录
 python build.py --name 去水印工具 --onefile
+
+python build.py --name 去水印工具 --onefile --clean --icon watermark_remover\logo.ico
 ```
 
 ### 方法二：使用 spec 文件
