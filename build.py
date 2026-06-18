@@ -143,9 +143,13 @@ def main():
         print(f"  logo: {logo_src}")
 
     # 收集子模块
+    # 注意: 不要对 cv2 使用 --collect-all, 那样会把 cv2 同时拷到
+    # Contents/Frameworks 和 Contents/Resources/cv2, 触发 OpenCV
+    # 自身的递归加载保护 (sys.OpenCV_LOADER 标志) 而闪退。
+    # 6.x 已自动收集 cv2 的二进制依赖, 这里仅确保数据文件被打包。
     cmd.extend([
         '--collect-submodules', 'watermark_remover',
-        '--collect-submodules', 'cv2',
+        '--collect-data', 'cv2',
     ])
 
     # 隐式依赖
@@ -154,9 +158,27 @@ def main():
         '--hidden-import', 'PIL._tkinter_finder',
     ])
 
+    # Runtime hook: 修复 macOS .app bundle 下 OpenCV 递归加载错误
+    # (PyInstaller 6.x 把 cv2 同时软链到 Frameworks/ 和 Resources/cv2,
+    #  sys.path 中出现两个 cv2 父目录, 触发 OpenCV 自身的递归保护)
+    runtime_hook = os.path.join(project_root, 'hooks', '_fix_cv2_recursion.py')
+    if os.path.exists(runtime_hook):
+        cmd.extend(['--runtime-hook', runtime_hook])
+
     # macOS 特殊处理: 高 DPI
+    # PyInstaller 5.0+ 已默认启用 HiDPI，无需此参数；
+    # 仅在旧版 (≤ 4.x) 中需要显式添加。
     if sys.platform == 'darwin':
-        cmd.append('--high-dpi-support')
+        try:
+            from packaging.version import parse as _parse_version
+            _pyi_ver = _parse_version(PyInstaller.__version__)
+            if _pyi_ver < _parse_version('5.0'):
+                cmd.append('--high-dpi-support')
+            else:
+                print(f"  HiDPI: 由 PyInstaller {_pyi_ver} 默认支持")
+        except Exception:
+            # 缺少 packaging 或解析失败时按新版处理，跳过该参数
+            print(f"  HiDPI: 跳过 --high-dpi-support (PyInstaller {PyInstaller.__version__})")
 
     # 入口文件
     cmd.append(os.path.join(project_root, 'run.py'))

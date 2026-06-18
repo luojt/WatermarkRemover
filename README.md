@@ -134,6 +134,7 @@ watermark_remover/
     └── helpers.py             # 工具函数（含 resource_path 资源路径解析）
 run.py                         # 启动脚本
 build.py                       # 一键打包脚本（PyInstaller）
+build_dmg.sh                   # macOS DMG 安装包制作脚本
 WatermarkRemover.spec          # PyInstaller 规格文件
 requirements.txt               # Python 依赖列表
 ```
@@ -204,6 +205,18 @@ pyinstaller WatermarkRemover.spec
 | **Windows** | `dist/WatermarkRemover/WatermarkRemover.exe` |
 | **macOS** | `dist/WatermarkRemover.app` |
 | **Linux** | `dist/WatermarkRemover/WatermarkRemover` |
+
+### 制作 macOS DMG 安装包 (可选)
+
+macOS 用户可使用 `build_dmg.sh` 将 `.app` 进一步打包为可分发的 DMG 安装包，窗口化布局含 `/Applications` 软链接，用户双击挂载后拖入即可安装。
+
+```bash
+brew install create-dmg    # 一次性安装
+./build_dmg.sh             # 默认: 运行 build.py 后再打 DMG
+./build_dmg.sh --skip-build # 仅生成 DMG
+```
+
+输出文件: `dist/WatermarkRemover.dmg`
 
 ### 注意事项
 

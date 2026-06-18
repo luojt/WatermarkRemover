@@ -1,0 +1,11 @@
+WatermarkRemover License Agreement
+
+This software is released under the MIT License.
+You are free to use, modify, and distribute this software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+For the full license text, please refer to the LICENSE file
+in the project repository.
+
+By installing this software, you agree to the terms above.
