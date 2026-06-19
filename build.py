@@ -142,6 +142,16 @@ def main():
             cmd.extend(['--add-data', f'{logo_src}:{logo_dst}'])
         print(f"  logo: {logo_src}")
 
+    # 添加 icons 目录（功能图标资源）
+    icons_src = os.path.join(project_root, 'watermark_remover', 'icons')
+    if os.path.isdir(icons_src):
+        icons_dst = 'watermark_remover/icons'
+        if sys.platform == 'win32':
+            cmd.extend(['--add-data', f'{icons_src};{icons_dst}'])
+        else:
+            cmd.extend(['--add-data', f'{icons_src}:{icons_dst}'])
+        print(f"  icons: {icons_src}/")
+
     # 收集子模块
     # 注意: 不要对 cv2 使用 --collect-all, 那样会把 cv2 同时拷到
     # Contents/Frameworks 和 Contents/Resources/cv2, 触发 OpenCV

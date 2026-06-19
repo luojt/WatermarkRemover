@@ -6,7 +6,7 @@
 - 图像预览和对比
 - 水印区域框选
 - 去水印算法选择和应用
-- 撤销/重做
+- 撤销/恢复
 - 批量处理
 """
 
@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QComboBox, QSlider, QSpinBox,
     QGroupBox, QFileDialog, QMessageBox, QProgressBar,
     QScrollArea, QSplitter, QFrame, QCheckBox,
-    QToolBar, QStatusBar, QAction, QMenu, QToolButton,
+    QToolBar, QStatusBar, QAction, QActionGroup, QMenu, QToolButton,
     QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
     QTabWidget, QApplication, QSizePolicy, QGridLayout,
     QDoubleSpinBox, QLineEdit, QRadioButton, QButtonGroup,
@@ -43,6 +43,35 @@ from ..utils.helpers import (
     format_file_size, limit_image_size, resource_path
 )
 from .styles import get_style
+from .theme import get_manager, ThemeMode, ThemePalette
+from .icons import IconName, get_pixmap, get_icon, get_multi_size_icon
+
+
+def _drop_area_qss(p: ThemePalette) -> str:
+    """生成 DropArea 控件的样式表（使用主题调色板）"""
+    return f"""
+        DropArea {{
+            border: 2px dashed {p.border_light};
+            border-radius: 12px;
+            background-color: {p.alternate_bg};
+        }}
+        DropArea[hover="true"] {{
+            border: 2px dashed {p.primary};
+            border-radius: 12px;
+            background-color: {p.selection_bg};
+        }}
+        DropArea QLabel {{
+            color: {p.window_text};
+            background-color: transparent;
+            border: none;
+        }}
+        DropArea QLabel#mutedLabel {{
+            color: {p.muted_text};
+        }}
+        DropArea QLabel#infoLabel {{
+            color: {p.info_text};
+        }}
+    """
 
 
 class DropArea(QWidget):
@@ -52,73 +81,56 @@ class DropArea(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("DropArea")
         self.setAcceptDrops(True)
         self.setMinimumSize(300, 200)
         self.setMaximumHeight(250)
         self._hover = False
 
         # 设置样式
-        self.setStyleSheet("""
-            DropArea {
-                border: 2px dashed #bdbdbd;
-                border-radius: 12px;
-                background-color: #fafafa;
-            }
-            DropArea:hover {
-                border-color: #1976d2;
-                background-color: #e3f2fd;
-            }
-        """)
+        self._refresh_style()
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
 
-        self._icon_label = QLabel("📁")
+        self._icon_label = QLabel()
         self._icon_label.setAlignment(Qt.AlignCenter)
-        self._icon_label.setStyleSheet("font-size: 48px; border: none;")
+        self._icon_label.setStyleSheet("border: none; background: transparent;")
+        self._icon_label.setPixmap(get_pixmap(IconName.FOLDER, size=64))
         layout.addWidget(self._icon_label)
 
         self._text_label = QLabel("拖拽图片到此处\n或点击下方按钮选择文件")
         self._text_label.setAlignment(Qt.AlignCenter)
-        self._text_label.setStyleSheet("font-size: 14px; color: #666; border: none;")
+        self._text_label.setObjectName("infoLabel")
+        self._text_label.setStyleSheet("font-size: 14px; border: none; background: transparent;")
         layout.addWidget(self._text_label)
 
         self._format_label = QLabel("支持 JPG、PNG、BMP、TIFF、WEBP 等格式")
         self._format_label.setAlignment(Qt.AlignCenter)
-        self._format_label.setStyleSheet("font-size: 11px; color: #999; border: none;")
+        self._format_label.setObjectName("mutedLabel")
+        self._format_label.setStyleSheet("font-size: 11px; border: none; background: transparent;")
         layout.addWidget(self._format_label)
+
+    def _refresh_style(self):
+        p = get_manager().palette
+        self.setStyleSheet(_drop_area_qss(p))
+        # 刷新图标（主题色已变化）
+        if hasattr(self, '_icon_label'):
+            self._icon_label.setPixmap(get_pixmap(IconName.FOLDER, size=64))
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             self._hover = True
             event.acceptProposedAction()
-            self.setStyleSheet("""
-                DropArea {
-                    border: 2px dashed #1976d2;
-                    border-radius: 12px;
-                    background-color: #bbdefb;
-                }
-            """)
+            self._refresh_style()
 
     def dragLeaveEvent(self, event):
         self._hover = False
-        self.setStyleSheet("""
-            DropArea {
-                border: 2px dashed #bdbdbd;
-                border-radius: 12px;
-                background-color: #fafafa;
-            }
-        """)
+        self._refresh_style()
 
     def dropEvent(self, event: QDropEvent):
         self._hover = False
-        self.setStyleSheet("""
-            DropArea {
-                border: 2px dashed #bdbdbd;
-                border-radius: 12px;
-                background-color: #fafafa;
-            }
-        """)
+        self._refresh_style()
 
         files = []
         for url in event.mimeData().urls():
@@ -170,7 +182,7 @@ class ImageViewer(QWidget):
 
         self.setMouseTracking(True)
         self.setMinimumSize(300, 200)
-        self.setStyleSheet("background-color: #333; border-radius: 4px;")
+        self._refresh_style()
         self._update_cursor()
 
     def _update_cursor(self):
@@ -185,6 +197,18 @@ class ImageViewer(QWidget):
         if mode == self.MODE_SELECT:
             self._auto_fit()
         self._update_cursor()
+        self.update()
+
+    def _refresh_style(self):
+        """根据当前主题刷新样式"""
+        p = get_manager().palette
+        self.setStyleSheet(
+            f"background-color: {p.viewer_bg}; border-radius: 4px;"
+        )
+
+    def apply_theme(self):
+        """主题变更时由外部调用，重绘以更新占位文字颜色等"""
+        self._refresh_style()
         self.update()
 
     def set_pixmap(self, pixmap: Optional[QPixmap]):
@@ -272,7 +296,9 @@ class ImageViewer(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        painter.fillRect(self.rect(), QColor(50, 50, 50))
+        p = get_manager().palette
+        viewer_bg = QColor(p.viewer_bg)
+        painter.fillRect(self.rect(), viewer_bg)
 
         if self._pixmap and not self._pixmap.isNull():
             pw, ph = self._pixmap.width(), self._pixmap.height()
@@ -307,24 +333,31 @@ class ImageViewer(QWidget):
             # ----- 状态覆盖层 -----
             mode_text = "框选模式" if self._mode == self.MODE_SELECT else "查看模式"
             info = f"{100.0 * self._scale:.0f}%  {mode_text}"
-            painter.setPen(QColor(200, 200, 200, 200))
+            painter.setPen(QColor(p.info_text))
             painter.setFont(QFont("Microsoft YaHei", 10))
             painter.drawText(self.rect().adjusted(8, 8, -8, -8),
                              Qt.AlignTop | Qt.AlignLeft, info)
         else:
-            painter.setPen(QColor(180, 180, 180))
+            painter.setPen(QColor(p.placeholder_text))
             painter.setFont(QFont("Microsoft YaHei", 14))
             painter.drawText(self.rect(), Qt.AlignCenter, "请先加载图片")
 
     def _paint_selection(self, painter: QPainter, rect: QRectF):
-        """绘制选区"""
-        painter.fillRect(rect, QColor(30, 100, 200, 40))
-        pen = QPen(QColor(30, 136, 229), 2)
+        """绘制选区（使用主题主色，在亮色和暗色主题下都清晰可见）"""
+        p = get_manager().palette
+        primary = QColor(p.primary)
+        # 半透明填充
+        fill_color = QColor(primary)
+        fill_color.setAlpha(40)
+        painter.fillRect(rect, fill_color)
+        # 虚线边框
+        pen = QPen(primary, 2)
         pen.setDashPattern([6, 3])
         painter.setPen(pen)
         painter.drawRect(rect)
+        # 角点（用白色确保在亮色边框上可见）
         painter.setPen(QPen(QColor(255, 255, 255), 1))
-        painter.setBrush(QBrush(QColor(30, 136, 229)))
+        painter.setBrush(QBrush(primary))
         hs = 5
         for corner in [rect.topLeft(), rect.topRight(),
                        rect.bottomLeft(), rect.bottomRight()]:
@@ -448,7 +481,7 @@ class PanZoomLabel(QWidget):
         self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.OpenHandCursor))
         self.setMinimumSize(200, 150)
-        self.setStyleSheet("background-color: #333; border-radius: 4px;")
+        self._refresh_style()
 
     # ---- 公共接口 ----
 
@@ -483,6 +516,18 @@ class PanZoomLabel(QWidget):
         self._pixmap = None
         self._offset = QPointF(0, 0)
         self._scale = 1.0
+        self.update()
+
+    def _refresh_style(self):
+        """根据当前主题刷新样式"""
+        p = get_manager().palette
+        self.setStyleSheet(
+            f"background-color: {p.viewer_bg}; border-radius: 4px;"
+        )
+
+    def apply_theme(self):
+        """主题变更时由外部调用"""
+        self._refresh_style()
         self.update()
 
     def reset_view(self):
@@ -550,7 +595,9 @@ class PanZoomLabel(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        painter.fillRect(self.rect(), QColor(50, 50, 50))
+        p = get_manager().palette
+        viewer_bg = QColor(p.viewer_bg)
+        painter.fillRect(self.rect(), viewer_bg)
 
         if self._pixmap and not self._pixmap.isNull():
             pw, ph = self._pixmap.width(), self._pixmap.height()
@@ -563,12 +610,12 @@ class PanZoomLabel(QWidget):
 
             # 缩放比例覆盖层
             info = f"{100.0 * self._scale:.0f}%"
-            painter.setPen(QColor(200, 200, 200, 200))
+            painter.setPen(QColor(p.info_text))
             painter.setFont(QFont("Microsoft YaHei", 10))
             painter.drawText(self.rect().adjusted(6, 6, -6, -6),
                              Qt.AlignTop | Qt.AlignLeft, info)
         elif self._placeholder_text:
-            painter.setPen(QColor(180, 180, 180))
+            painter.setPen(QColor(p.placeholder_text))
             painter.setFont(QFont("Microsoft YaHei", 14))
             painter.drawText(self.rect(), Qt.AlignCenter, self._placeholder_text)
 
@@ -623,7 +670,8 @@ class ImagePreviewDialog(QDialog):
 
         # 提示
         hint = QLabel("滚轮缩放 · 拖拽平移")
-        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setObjectName("mutedLabel")
+        hint.setStyleSheet("font-size: 11px;")
         layout.addWidget(hint)
 
         # 全尺寸 PanZoomLabel
@@ -634,7 +682,8 @@ class ImagePreviewDialog(QDialog):
         # 底部缩放信息 + 关闭
         bottom = QHBoxLayout()
         self._zoom_label = QLabel("100%")
-        self._zoom_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._zoom_label.setObjectName("zoomLabel")
+        self._zoom_label.setStyleSheet("font-size: 11px;")
         bottom.addWidget(self._zoom_label)
 
         self._viewer.scale_changed.connect(
@@ -683,29 +732,30 @@ class CompareView(QWidget):
         self._sync_btn = QToolButton()
         self._sync_btn.setCheckable(True)
         self._sync_btn.setChecked(False)
-        self._sync_btn.setText("□ 同步")
+        self._sync_btn.setIcon(get_icon(IconName.SYNC))
+        self._sync_btn.setIconSize(QSize(16, 16))
+        self._sync_btn.setText(" 同步")
         self._sync_btn.setToolTip("同步缩放和平移操作")
-        self._sync_btn.setStyleSheet("""
-            QToolButton { padding: 4px 10px; border: 1px solid #888;
-                          border-radius: 4px; font-size: 11px; }
-            QToolButton:checked { background-color: #1565c0; color: white;
-                                  border-color: #1565c0; }
-        """)
+        self._sync_btn.setObjectName("syncBtn")
+        self._refresh_sync_style()
         self._sync_btn.toggled.connect(self._on_sync_toggled)
         toolbar.addWidget(self._sync_btn)
 
         self._reset_all_btn = QToolButton()
-        self._reset_all_btn.setText("↺ 重置")
+        self._reset_all_btn.setIcon(get_icon(IconName.RESET))
+        self._reset_all_btn.setIconSize(QSize(16, 16))
+        self._reset_all_btn.setText(" 重置")
         self._reset_all_btn.setToolTip("重置两侧视图")
-        self._reset_all_btn.setStyleSheet(
-            "QToolButton { padding: 4px 10px; border-radius: 4px; font-size: 11px; }")
+        self._reset_all_btn.setObjectName("resetAllBtn")
+        self._refresh_reset_all_style()
         self._reset_all_btn.clicked.connect(self._reset_all)
         toolbar.addWidget(self._reset_all_btn)
 
         toolbar.addStretch()
 
         hint = QLabel("滚轮缩放 · 拖拽平移")
-        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setObjectName("mutedLabel")
+        hint.setStyleSheet("font-size: 11px;")
         toolbar.addWidget(hint)
 
         main_layout.addLayout(toolbar)
@@ -716,7 +766,7 @@ class CompareView(QWidget):
 
         # 处理前
         orig_group = QGroupBox("处理前")
-        orig_group.setStyleSheet("QGroupBox{font-size:12px;font-weight:bold;}")
+        orig_group.setObjectName("compactGroupBox")
         orig_layout = QVBoxLayout(orig_group)
         orig_layout.setContentsMargins(4, 16, 4, 4)
         orig_layout.setSpacing(4)
@@ -728,19 +778,22 @@ class CompareView(QWidget):
         orig_btns = QHBoxLayout()
         orig_btns.setSpacing(4)
         orig_zoom_label = QLabel("100%")
-        orig_zoom_label.setStyleSheet("color:#aaa; font-size:10px;")
+        orig_zoom_label.setObjectName("zoomLabel")
+        orig_zoom_label.setStyleSheet("font-size:10px;")
         orig_btns.addWidget(orig_zoom_label)
         orig_btns.addStretch()
         orig_full_btn = QPushButton("放大查看")
+        orig_full_btn.setObjectName("btnSecondary")
         orig_full_btn.setFixedSize(64, 22)
         orig_full_btn.setStyleSheet("font-size:10px; padding:0 4px;")
         orig_full_btn.clicked.connect(
             lambda: self._open_preview_dialog(self._orig_view, "处理前"))
         orig_btns.addWidget(orig_full_btn)
         orig_reset = QToolButton()
-        orig_reset.setText("↺")
+        orig_reset.setIcon(get_icon(IconName.RESET))
+        orig_reset.setIconSize(QSize(14, 14))
         orig_reset.setToolTip("重置此视图")
-        orig_reset.setFixedSize(24, 22)
+        orig_reset.setFixedSize(28, 22)
         orig_reset.clicked.connect(lambda: self._orig_view.reset_view())
         orig_btns.addWidget(orig_reset)
         orig_layout.addLayout(orig_btns)
@@ -749,7 +802,7 @@ class CompareView(QWidget):
 
         # 处理后
         rst_group = QGroupBox("处理后")
-        rst_group.setStyleSheet("QGroupBox{font-size:12px;font-weight:bold;}")
+        rst_group.setObjectName("compactGroupBox")
         rst_layout = QVBoxLayout(rst_group)
         rst_layout.setContentsMargins(4, 16, 4, 4)
         rst_layout.setSpacing(4)
@@ -761,19 +814,22 @@ class CompareView(QWidget):
         rst_btns = QHBoxLayout()
         rst_btns.setSpacing(4)
         rst_zoom_label = QLabel("100%")
-        rst_zoom_label.setStyleSheet("color:#aaa; font-size:10px;")
+        rst_zoom_label.setObjectName("zoomLabel")
+        rst_zoom_label.setStyleSheet("font-size:10px;")
         rst_btns.addWidget(rst_zoom_label)
         rst_btns.addStretch()
         rst_full_btn = QPushButton("放大查看")
+        rst_full_btn.setObjectName("btnSecondary")
         rst_full_btn.setFixedSize(64, 22)
         rst_full_btn.setStyleSheet("font-size:10px; padding:0 4px;")
         rst_full_btn.clicked.connect(
             lambda: self._open_preview_dialog(self._rst_view, "处理后"))
         rst_btns.addWidget(rst_full_btn)
         rst_reset = QToolButton()
-        rst_reset.setText("↺")
+        rst_reset.setIcon(get_icon(IconName.RESET))
+        rst_reset.setIconSize(QSize(14, 14))
         rst_reset.setToolTip("重置此视图")
-        rst_reset.setFixedSize(24, 22)
+        rst_reset.setFixedSize(28, 22)
         rst_reset.clicked.connect(lambda: self._rst_view.reset_view())
         rst_btns.addWidget(rst_reset)
         rst_layout.addLayout(rst_btns)
@@ -837,6 +893,51 @@ class CompareView(QWidget):
     def _reset_all(self):
         self._orig_view.reset_view()
         self._rst_view.reset_view()
+
+    # ---- 主题适配 ----
+
+    def _refresh_sync_style(self):
+        """刷新同步按钮样式（使用主题色）"""
+        p = get_manager().palette
+        self._sync_btn.setStyleSheet(
+            f"QToolButton {{ padding: 4px 10px; border: 1px solid {p.border_light};"
+            f" border-radius: 4px; font-size: 11px; color: {p.window_text}; }}"
+            f"QToolButton:checked {{ background-color: {p.primary}; color: white;"
+            f" border-color: {p.primary}; }}"
+            f"QToolButton:hover:!checked {{ background-color: {p.selection_bg};"
+            f" color: {p.selection_text}; }}"
+        )
+
+    def _refresh_reset_all_style(self):
+        """刷新重置按钮样式"""
+        p = get_manager().palette
+        self._reset_all_btn.setStyleSheet(
+            f"QToolButton {{ padding: 4px 10px; border-radius: 4px; font-size: 11px;"
+            f" color: {p.window_text}; }}"
+            f"QToolButton:hover {{ background-color: {p.selection_bg};"
+            f" color: {p.selection_text}; }}"
+        )
+
+    def apply_theme(self):
+        """主题变更时调用，刷新子控件样式"""
+        self._refresh_sync_style()
+        self._refresh_reset_all_style()
+        # 刷新图标
+        if hasattr(self, '_sync_btn'):
+            self._sync_btn.setIcon(get_icon(IconName.SYNC))
+        if hasattr(self, '_reset_all_btn'):
+            self._reset_all_btn.setIcon(get_icon(IconName.RESET))
+        # 刷新左右两侧的重置按钮
+        self._refresh_reset_buttons()
+        self._orig_view.apply_theme()
+        self._rst_view.apply_theme()
+        # 触发 GroupBox 标题样式刷新（重新应用全局样式即可）
+
+    def _refresh_reset_buttons(self):
+        """刷新两个 "重置" 工具按钮的图标"""
+        for btn in self.findChildren(QToolButton):
+            if btn.toolTip() == "重置此视图":
+                btn.setIcon(get_icon(IconName.RESET))
 
 
 class BatchProcessor(QThread):
@@ -1090,7 +1191,7 @@ class BatchDialog(QDialog):
         self._status_label.setText(f"正在处理: {filename} ({current}/{total})")
 
     def _on_file_processed(self, file_path: str, success: bool):
-        status = "✓" if success else "✗"
+        status = "[OK]" if success else "[X]"
         for i in range(self._file_list.count()):
             item = self._file_list.item(i)
             if item and file_path in item.toolTip():
@@ -1140,7 +1241,9 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._setup_menu()
+        self._init_theme_menu()
         self._setup_connections()
+        self._connect_theme_signals()
         self._update_ui_state()
 
     def _setup_ui(self):
@@ -1176,30 +1279,41 @@ class MainWindow(QMainWindow):
 
         # 预览控制栏
         preview_controls = QHBoxLayout()
+
+        # 工具栏按钮统一使用图标，图标随主题自动着色
         self._zoom_in_btn = QToolButton()
-        self._zoom_in_btn.setText("🔍+")
+        self._zoom_in_btn.setIcon(get_icon(IconName.ZOOM_IN))
+        self._zoom_in_btn.setIconSize(QSize(20, 20))
         self._zoom_in_btn.setToolTip("放大")
         self._zoom_in_btn.clicked.connect(self._zoom_in)
 
         self._zoom_out_btn = QToolButton()
-        self._zoom_out_btn.setText("🔍-")
+        self._zoom_out_btn.setIcon(get_icon(IconName.ZOOM_OUT))
+        self._zoom_out_btn.setIconSize(QSize(20, 20))
         self._zoom_out_btn.setToolTip("缩小")
         self._zoom_out_btn.clicked.connect(self._zoom_out)
 
         self._zoom_fit_btn = QToolButton()
-        self._zoom_fit_btn.setText("🔍")
+        self._zoom_fit_btn.setIcon(get_icon(IconName.ZOOM_FIT))
+        self._zoom_fit_btn.setIconSize(QSize(20, 20))
         self._zoom_fit_btn.setToolTip("适合窗口")
         self._zoom_fit_btn.clicked.connect(self._zoom_fit)
 
         self._select_mode_btn = QToolButton()
-        self._select_mode_btn.setText("✏️ 框选")
+        self._select_mode_btn.setIcon(get_icon(IconName.SELECT))
+        self._select_mode_btn.setIconSize(QSize(20, 20))
+        self._select_mode_btn.setText(" 框选")
         self._select_mode_btn.setToolTip("框选水印区域")
         self._select_mode_btn.setCheckable(True)
         self._select_mode_btn.setChecked(True)
+        self._select_mode_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
         self._clear_select_btn = QToolButton()
-        self._clear_select_btn.setText("🗑️ 清除选区")
+        self._clear_select_btn.setIcon(get_icon(IconName.TRASH))
+        self._clear_select_btn.setIconSize(QSize(20, 20))
+        self._clear_select_btn.setText(" 清除选区")
         self._clear_select_btn.setToolTip("清除所有选区")
+        self._clear_select_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
         preview_controls.addWidget(self._zoom_in_btn)
         preview_controls.addWidget(self._zoom_out_btn)
@@ -1243,7 +1357,8 @@ class MainWindow(QMainWindow):
         # 算法说明
         self._algo_desc = QLabel("使用 OpenCV 的 Telea 算法进行图像修复，适合去除较小面积的文字水印。")
         self._algo_desc.setWordWrap(True)
-        self._algo_desc.setStyleSheet("font-size: 11px; color: #888; padding: 4px;")
+        self._algo_desc.setObjectName("mutedLabel")
+        self._algo_desc.setStyleSheet("font-size: 11px; padding: 4px;")
         algo_layout.addWidget(self._algo_desc)
         basic_layout.addWidget(algo_group)
 
@@ -1270,17 +1385,25 @@ class MainWindow(QMainWindow):
         btn_group = QGroupBox("操作")
         btn_layout = QVBoxLayout(btn_group)
 
-        self._apply_btn = QPushButton("▶ 执行去水印")
+        self._apply_btn = QPushButton(" 执行去水印")
+        self._apply_btn.setIcon(get_icon(IconName.PLAY))
+        self._apply_btn.setIconSize(QSize(18, 18))
         self._apply_btn.setObjectName("btnSuccess")
         self._apply_btn.setMinimumHeight(40)
         btn_layout.addWidget(self._apply_btn)
 
         action_row = QHBoxLayout()
-        self._undo_btn = QPushButton("↩ 撤销")
+        self._undo_btn = QPushButton(" 撤销")
+        self._undo_btn.setIcon(get_icon(IconName.UNDO))
+        self._undo_btn.setIconSize(QSize(16, 16))
         self._undo_btn.setObjectName("btnSecondary")
-        self._redo_btn = QPushButton("↪ 重做")
+        self._redo_btn = QPushButton(" 恢复")
+        self._redo_btn.setIcon(get_icon(IconName.REDO))
+        self._redo_btn.setIconSize(QSize(16, 16))
         self._redo_btn.setObjectName("btnSecondary")
-        self._reset_btn = QPushButton("↺ 重置")
+        self._reset_btn = QPushButton(" 重置")
+        self._reset_btn.setIcon(get_icon(IconName.RESET))
+        self._reset_btn.setIconSize(QSize(16, 16))
         self._reset_btn.setObjectName("btnDanger")
         action_row.addWidget(self._undo_btn)
         action_row.addWidget(self._redo_btn)
@@ -1302,7 +1425,9 @@ class MainWindow(QMainWindow):
         self._compare_view = CompareView()
         compare_layout.addWidget(self._compare_view, 1)
 
-        self._toggle_compare_btn = QPushButton("显示对比预览")
+        self._toggle_compare_btn = QPushButton(" 显示对比预览")
+        self._toggle_compare_btn.setIcon(get_icon(IconName.COMPARE))
+        self._toggle_compare_btn.setIconSize(QSize(14, 14))
         self._toggle_compare_btn.setObjectName("btnSecondary")
         self._toggle_compare_btn.setMaximumHeight(28)
         compare_layout.addWidget(self._toggle_compare_btn)
@@ -1339,17 +1464,21 @@ class MainWindow(QMainWindow):
 
         # 保存和批量按钮行
         action_row = QHBoxLayout()
-        self._save_btn = QPushButton("💾 保存图像")
+        self._save_btn = QPushButton(" 保存图像")
+        self._save_btn.setIcon(get_icon(IconName.SAVE))
+        self._save_btn.setIconSize(QSize(16, 16))
         self._save_btn.setObjectName("btnSuccess")
         self._save_btn.setMinimumHeight(32)
         action_row.addWidget(self._save_btn)
 
-        self._save_as_btn = QPushButton("另存为...")
+        self._save_as_btn = QPushButton(" 另存为...")
         self._save_as_btn.setObjectName("btnSecondary")
         self._save_as_btn.setMinimumHeight(32)
         action_row.addWidget(self._save_as_btn)
 
-        self._batch_btn = QPushButton("📦 批量处理")
+        self._batch_btn = QPushButton(" 批量处理")
+        self._batch_btn.setIcon(get_icon(IconName.BATCH))
+        self._batch_btn.setIconSize(QSize(16, 16))
         self._batch_btn.setMinimumHeight(32)
         action_row.addWidget(self._batch_btn)
 
@@ -1370,8 +1499,17 @@ class MainWindow(QMainWindow):
         self._status_bar.addWidget(self._status_label, 1)
 
         self._file_info_label = QLabel("")
-        self._file_info_label.setStyleSheet("color: #666;")
+        self._file_info_label.setObjectName("infoLabel")
         self._status_bar.addPermanentWidget(self._file_info_label)
+
+        # 主题状态指示器（按钮形式，点击打开主题菜单）
+        # 注意：_theme_menu 在 _setup_menu 中才创建，这里只创建占位按钮，
+        # _init_theme_menu 之后再绑定菜单和刷新图标
+        self._theme_indicator_btn = QToolButton()
+        self._theme_indicator_btn.setObjectName("themeIndicator")
+        self._theme_indicator_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._theme_indicator_btn.setPopupMode(QToolButton.InstantPopup)
+        self._status_bar.addPermanentWidget(self._theme_indicator_btn)
 
         # 应用全局样式
         self.setStyleSheet(get_style())
@@ -1383,24 +1521,24 @@ class MainWindow(QMainWindow):
         # 文件菜单
         file_menu = menubar.addMenu("文件(&F)")
 
-        open_action = QAction("打开图片(&O)...", self)
+        open_action = QAction(get_icon(IconName.OPEN), "打开图片(&O)...", self)
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self._open_file)
         file_menu.addAction(open_action)
 
-        save_action = QAction("保存(&S)", self)
+        save_action = QAction(get_icon(IconName.SAVE), "保存(&S)", self)
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(self._save_image)
         file_menu.addAction(save_action)
 
-        save_as_action = QAction("另存为(&A)...", self)
+        save_as_action = QAction(get_icon(IconName.SAVE), "另存为(&A)...", self)
         save_as_action.setShortcut("Ctrl+Shift+S")
         save_as_action.triggered.connect(self._save_image_as)
         file_menu.addAction(save_as_action)
 
         file_menu.addSeparator()
 
-        batch_action = QAction("批量处理(&B)...", self)
+        batch_action = QAction(get_icon(IconName.BATCH), "批量处理(&B)...", self)
         batch_action.setShortcut("Ctrl+B")
         batch_action.triggered.connect(self._open_batch_dialog)
         file_menu.addAction(batch_action)
@@ -1415,19 +1553,19 @@ class MainWindow(QMainWindow):
         # 编辑菜单
         edit_menu = menubar.addMenu("编辑(&E)")
 
-        undo_action = QAction("撤销(&U)", self)
+        undo_action = QAction(get_icon(IconName.UNDO), "撤销(&U)", self)
         undo_action.setShortcut("Ctrl+Z")
         undo_action.triggered.connect(self._undo)
         edit_menu.addAction(undo_action)
 
-        redo_action = QAction("重做(&R)", self)
+        redo_action = QAction(get_icon(IconName.REDO), "恢复(&R)", self)
         redo_action.setShortcut("Ctrl+Y")
         redo_action.triggered.connect(self._redo)
         edit_menu.addAction(redo_action)
 
         edit_menu.addSeparator()
 
-        reset_action = QAction("重置为原始图像", self)
+        reset_action = QAction(get_icon(IconName.RESET), "重置为原始图像", self)
         reset_action.setShortcut("Ctrl+R")
         reset_action.triggered.connect(self._reset)
         edit_menu.addAction(reset_action)
@@ -1435,7 +1573,7 @@ class MainWindow(QMainWindow):
         # 处理菜单
         process_menu = menubar.addMenu("处理(&P)")
 
-        apply_action = QAction("执行去水印", self)
+        apply_action = QAction(get_icon(IconName.PLAY), "执行去水印", self)
         apply_action.setShortcut("Ctrl+Enter")
         apply_action.triggered.connect(self._apply_algorithm)
         process_menu.addAction(apply_action)
@@ -1443,15 +1581,19 @@ class MainWindow(QMainWindow):
         # 视图菜单
         view_menu = menubar.addMenu("视图(&V)")
 
-        compare_action = QAction("对比预览", self)
+        compare_action = QAction(get_icon(IconName.COMPARE), "对比预览", self)
         compare_action.setShortcut("Ctrl+C")
         compare_action.triggered.connect(self._toggle_compare)
         view_menu.addAction(compare_action)
 
+        # 主题子菜单（占位，_init_theme_menu 中填充内容）
+        self._theme_menu = view_menu.addMenu("主题(&T)")
+        self._theme_actions = {}
+
         # 帮助菜单
         help_menu = menubar.addMenu("帮助(&H)")
 
-        about_action = QAction("关于(&A)", self)
+        about_action = QAction(get_icon(IconName.INFO), "关于(&A)", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
@@ -1657,7 +1799,7 @@ class MainWindow(QMainWindow):
 
     def _redo(self):
         if self._processor.redo():
-            self._status_label.setText("已重做")
+            self._status_label.setText("已恢复")
 
     def _reset(self):
         reply = QMessageBox.question(
@@ -1686,10 +1828,10 @@ class MainWindow(QMainWindow):
         self._compare_view.setVisible(self._is_comparing)
 
         if self._is_comparing:
-            self._toggle_compare_btn.setText("隐藏对比预览")
+            self._toggle_compare_btn.setText(" 隐藏对比预览")
             self._refresh_preview()
         else:
-            self._toggle_compare_btn.setText("显示对比预览")
+            self._toggle_compare_btn.setText(" 显示对比预览")
 
     def _save_image(self):
         """保存图像"""
@@ -1773,7 +1915,7 @@ class MainWindow(QMainWindow):
             "<li>多种去水印算法</li>"
             "<li>精确框选水印区域</li>"
             "<li>批量处理</li>"
-            "<li>撤销/重做</li>"
+            "<li>撤销/恢复</li>"
             "<li>前后对比预览</li>"
             "</ul>"
         )
@@ -1792,6 +1934,174 @@ class MainWindow(QMainWindow):
                 files.append(file_path)
         if files:
             self._on_files_dropped(files)
+
+    # ---- 主题切换 ----
+
+    def _init_theme_menu(self):
+        """初始化主题菜单（三个互斥选项 + Auto 当前指示）
+
+        每个主题有"轮廓版"和"填充版"两套图标：
+        - 轮廓版：未选中时显示（普通状态）
+        - 填充版：选中时显示（强调状态，与 menu_selected_bg 背景形成强烈对比）
+        """
+        self._theme_action_group = QActionGroup(self)
+        self._theme_action_group.setExclusive(True)
+
+        # (mode, 显示文本, 轮廓图标, 填充图标, 提示)
+        theme_defs = [
+            (ThemeMode.LIGHT, " 亮色主题",
+             IconName.SUN, IconName.SUN_FILLED,
+             "使用浅色界面（默认）"),
+            (ThemeMode.DARK,  " 暗色主题",
+             IconName.MOON, IconName.MOON_FILLED,
+             "使用深色界面，更适合夜间使用"),
+            (ThemeMode.AUTO,  " 跟随系统",
+             IconName.MONITOR, IconName.MONITOR_FILLED,
+             "根据操作系统的外观设置自动切换"),
+        ]
+
+        for mode, label, outline_icon, filled_icon, tip in theme_defs:
+            action = QAction(label, self, checkable=True)
+            # 保存当前主题对应的两个图标名，便于切换
+            action.setData((mode, outline_icon, filled_icon))
+            action.setToolTip(tip)
+            # 监听 toggled 信号动态切换图标
+            action.toggled.connect(
+                lambda checked, a=action: self._update_theme_action_icon(a, checked)
+            )
+            action.triggered.connect(
+                lambda checked, m=mode: self._on_theme_selected(m)
+            )
+            self._theme_action_group.addAction(action)
+            self._theme_menu.addAction(action)
+            self._theme_actions[mode] = action
+
+        # 同步当前选中状态（会触发 toggled 信号，调用 _update_theme_action_icon）
+        current_mode = get_manager().mode
+        if current_mode in self._theme_actions:
+            self._theme_actions[current_mode].setChecked(True)
+
+        # 为其他未选中的 action 设置初始轮廓图标
+        for mode, action in self._theme_actions.items():
+            if not action.isChecked():
+                _, outline_icon, _ = action.data()
+                action.setIcon(get_icon(outline_icon))
+
+        # 绑定主题菜单到状态栏指示器按钮，并刷新初始显示
+        if hasattr(self, '_theme_indicator_btn'):
+            self._theme_indicator_btn.setMenu(self._theme_menu)
+            self._refresh_theme_indicator()
+
+    def _update_theme_action_icon(self, action: QAction, checked: bool):
+        """根据选中状态切换主题图标的轮廓/填充版本"""
+        data = action.data()
+        if not data or not isinstance(data, tuple):
+            return
+        _, outline_icon, filled_icon = data
+        action.setIcon(get_icon(filled_icon if checked else outline_icon))
+
+    def _refresh_theme_indicator(self):
+        """刷新状态栏的主题指示器按钮
+
+        显示当前主题的填充图标 + 文本标签，提供清晰的视觉反馈。
+        """
+        if not hasattr(self, '_theme_indicator_btn'):
+            return
+
+        mode = get_manager().mode
+        info = {
+            ThemeMode.LIGHT: (IconName.SUN_FILLED, "亮色"),
+            ThemeMode.DARK:  (IconName.MOON_FILLED, "暗色"),
+            ThemeMode.AUTO:  (IconName.MONITOR_FILLED, "自动"),
+        }
+        icon_name, label = info[mode]
+
+        self._theme_indicator_btn.setIcon(get_icon(icon_name))
+        self._theme_indicator_btn.setIconSize(QSize(16, 16))
+        self._theme_indicator_btn.setText(f" {label}")
+        self._theme_indicator_btn.setToolTip(
+            f"当前主题: {label}\n点击切换主题模式"
+        )
+
+    def _connect_theme_signals(self):
+        """连接主题变更信号"""
+        get_manager().theme_changed.connect(self._apply_theme)
+        # 模式切换信号（即使调色板未变也要触发，用于刷新指示器文本）
+        get_manager().mode_changed.connect(self._on_mode_changed)
+
+    def _on_mode_changed(self, mode: str, palette: ThemePalette):
+        """模式切换时调用（可能调色板未变，如 DARK→AUTO 在深色系统下）
+
+        负责：菜单选中状态同步 + 状态栏指示器刷新 + 主题图标重新应用
+        """
+        # 同步菜单选中状态（QActionGroup 自身会处理互斥）
+        if mode in self._theme_actions:
+            action = self._theme_actions[mode]
+            # blockSignals 防止 toggled 信号递归触发图标切换（图标切换将由 _refresh_all_icons 统一处理）
+            action.blockSignals(True)
+            action.setChecked(True)
+            action.blockSignals(False)
+            # 立即更新此 action 的图标（反映新选中状态）
+            self._update_theme_action_icon(action, True)
+            # 同时把其他 action 切回轮廓图标
+            for other_mode, other_action in self._theme_actions.items():
+                if other_mode != mode:
+                    self._update_theme_action_icon(other_action, False)
+        # 刷新状态栏指示器
+        self._refresh_theme_indicator()
+
+    def _on_theme_selected(self, mode: str):
+        """用户从菜单选择主题"""
+        if mode != get_manager().mode:
+            get_manager().set_mode(mode)
+
+    def _apply_theme(self, name: str, palette: ThemePalette):
+        """应用主题 - 刷新所有需要主题感知的控件"""
+        # 重新应用全局 QSS（作用于整个窗口）
+        self.setStyleSheet(get_style())
+
+        # 刷新所有具有内联样式的子控件
+        self._drop_area._refresh_style()
+        self._image_viewer.apply_theme()
+        self._compare_view.apply_theme()
+
+        # 刷新所有图标（图标缓存已由 IconManager 自动清空）
+        self._refresh_all_icons()
+        # 刷新状态栏主题指示器
+        self._refresh_theme_indicator()
+
+        # 状态栏提示
+        mode_label = {
+            ThemeMode.LIGHT: "亮色",
+            ThemeMode.DARK: "暗色",
+            ThemeMode.AUTO: "跟随系统",
+        }.get(get_manager().mode, "亮色")
+        self._status_label.setText(f"已切换至{mode_label}主题")
+
+    def _refresh_all_icons(self):
+        """主题切换后刷新所有按钮/动作的图标"""
+        # 预览工具栏按钮
+        self._zoom_in_btn.setIcon(get_icon(IconName.ZOOM_IN))
+        self._zoom_out_btn.setIcon(get_icon(IconName.ZOOM_OUT))
+        self._zoom_fit_btn.setIcon(get_icon(IconName.ZOOM_FIT))
+        self._select_mode_btn.setIcon(get_icon(IconName.SELECT))
+        self._clear_select_btn.setIcon(get_icon(IconName.TRASH))
+
+        # 主操作按钮
+        self._apply_btn.setIcon(get_icon(IconName.PLAY))
+        self._undo_btn.setIcon(get_icon(IconName.UNDO))
+        self._redo_btn.setIcon(get_icon(IconName.REDO))
+        self._reset_btn.setIcon(get_icon(IconName.RESET))
+
+        # 保存与批量按钮
+        self._save_btn.setIcon(get_icon(IconName.SAVE))
+        self._batch_btn.setIcon(get_icon(IconName.BATCH))
+        self._toggle_compare_btn.setIcon(get_icon(IconName.COMPARE))
+
+        # 主题菜单项图标（根据选中状态使用填充或轮廓版）
+        if self._theme_actions:
+            for mode, action in self._theme_actions.items():
+                self._update_theme_action_icon(action, action.isChecked())
 
     def closeEvent(self, event):
         """关闭事件"""
