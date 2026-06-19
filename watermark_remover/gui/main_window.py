@@ -1843,10 +1843,13 @@ class MainWindow(QMainWindow):
         success = self._processor.apply_algorithm(algorithm, **kwargs)
 
         if success:
+            # 去水印成功后自动清除选区（视觉矩形 + mask），界面显示无选区状态
+            self._clear_selections()
             self._status_label.setText(f"处理完成: {algo_text}")
         else:
             self._status_label.setText("处理失败")
-            QMessageBox.warning(self, "处理失败", "图像处理失败，请重试或选择其他算法。")
+            QMessageBox.warning(self, "处理失败",
+                                "图像处理失败，请重试或选择其他算法。")
 
     def _undo(self):
         if self._processor.undo():

@@ -141,120 +141,185 @@ def texture_synthesis(image: np.ndarray, mask: np.ndarray,
 
     使用 Criminisi 算法的简化版本，从已知区域寻找最佳匹配块来填充水印区域。
 
-    性能优化点：
-    - 仅维护**边界轮廓（frontier）**像素集合，避免每次重建全部坐标列表
-    - 块匹配使用 cv2 模板匹配 + 掩码，按降采样步长搜索
-
-    Args:
-        image: 输入图像 (BGR格式)
-        mask: 二值掩码 (白色区域为需要填充的区域)
+    参数:
+        image: 输入图像 (BGR格式, uint8)
+        mask: 二值掩码 (白色区域为需要填充的区域, uint8)
         patch_size: 块大小 (奇数)
 
+    安全性:
+        - 大尺寸图像自动降采样（最大 500px）
+        - 绝对迭代上限 2000 次
+        - 内置 try/except 异常捕获
+        - 任何失败时回退为邻域均值填充
+
     Returns:
-        处理后的图像
+        处理后的图像 (uint8)
     """
+    # ---------- 输入验证 ----------
+    if image is None or image.size == 0:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
     if mask is None or not np.any(mask > 0):
         return image.copy()
 
-    result = image.copy().astype(np.float32)
-    work_mask = (mask > 0).astype(np.uint8)
     h, w = image.shape[:2]
-    half_patch = patch_size // 2
-    ph = patch_size
 
-    # ---------- 计算初始 frontier（待填充像素 + 邻域已知像素的边界） ----------
-    # known_mask = 1 表示已知区域
-    known_mask = (work_mask == 0).astype(np.uint8)
+    # ---------- 大尺寸图像保护 ----------
+    # 纹理合成是 O(N*M) 算法，超大图像会耗尽内存或冻结 UI
+    max_dim = 500
+    downscaled = False
+    scale = 1.0
+    work_img = image
+    work_mask = (mask > 0).astype(np.uint8)
+    if h > max_dim or w > max_dim:
+        scale = min(max_dim / h, max_dim / w)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        work_img = cv2.resize(image, (new_w, new_h),
+                              interpolation=cv2.INTER_AREA)
+        work_mask = cv2.resize((mask > 0).astype(np.uint8) * 255,
+                               (new_w, new_h),
+                               interpolation=cv2.INTER_NEAREST)
+        work_mask = (work_mask > 0).astype(np.uint8)
+        h, w = new_h, new_w
+        downscaled = True
 
-    # 初始 frontier = work_mask 的全部像素（待填充）
-    frontier = set(zip(*np.where(work_mask > 0)))
-    if not frontier:
-        return image.copy()
+    try:
+        result = work_img.astype(np.float32)
+        known_mask = (work_mask == 0).astype(np.uint8)
 
-    # 搜索步长：图像越大步长越大，最少 1，最多 16
-    # 同时限制搜索候选总数（避免 200x200 图像产生 ~2400 个候选导致单次 patch 匹配耗时数秒）
-    step = max(1, min(h, w) // 25)
-    max_candidates = 100  # 单次 patch 匹配最多采样 100 个候选
-    total_positions = ((h - ph) // step + 1) * ((w - ph) // step + 1)
-    if total_positions > max_candidates:
-        # 按比例放大步长以减少候选数
-        scale = (total_positions / max_candidates) ** 0.5
-        step = max(step, int(step * scale))
+        # 前置检查：如果 mask 面积过大，直接回退到均值填充
+        mask_pixels = int(np.sum(work_mask))
+        max_pixels = int(h * w * 0.8)  # mask 超过 80% 图像面积则弃用块匹配
+        if mask_pixels > max_pixels or mask_pixels < 1:
+            # 用邻域填充直接兜底
+            _fill_remaining(result, known_mask, work_mask)
+            small_out = result.astype(np.uint8)
+            return _composite_output(small_out, image, mask, downscaled, h, w)
 
-    max_iters = max(1, len(frontier) * 4)  # 兜底：最多每个像素尝试 4 次
-    iters = 0
+        half_patch = patch_size // 2
+        ph = patch_size
 
-    while frontier and iters < max_iters:
-        iters += 1
-        # 取一个 frontier 像素
-        y, x = frontier.pop()
+        # ---------- 构建 frontier ----------
+        frontier = set(zip(*np.where(work_mask > 0)))
 
-        # 提取待填充块（含边界裁剪）
-        y1, y2 = max(0, y - half_patch), min(h, y + half_patch + 1)
-        x1, x2 = max(0, x - half_patch), min(w, x + half_patch + 1)
-        patch_h, patch_w = y2 - y1, x2 - x1
-        if patch_h != ph or patch_w != ph:
-            # 边界附近忽略（无法组成完整块）— 直接按均值填充
-            result[y, x] = _neighbor_mean(result, known_mask, y, x)
-            work_mask[y, x] = 0
-            known_mask[y, x] = 1
-            continue
+        # 搜索步长：控制候选总数 ≤ 100
+        step = max(1, min(h, w) // 25)
+        total_positions = ((h - ph) // step + 1) * ((w - ph) // step + 1)
+        max_candidates = 100
+        if total_positions > max_candidates:
+            scale_step = (total_positions / max_candidates) ** 0.5
+            step = max(step, int(step * scale_step))
 
-        target_patch = result[y1:y2, x1:x2]
-        target_known = known_mask[y1:y2, x1:x2]
-        if not np.any(target_known):
-            continue
+        # 绝对迭代上限（而不是 len(frontier) * 4，后者可能达数百万）
+        max_iters = min(2000, mask_pixels * 2)
+        max_iters = max(10, max_iters)
+        iters = 0
+        frontier_update_counter = 0
 
-        # ---------- 在已知区域采样搜索最佳匹配块 ----------
-        best_ssd = float('inf')
-        best_src_y = best_src_x = None
+        while frontier and iters < max_iters:
+            iters += 1
+            try:
+                y, x = frontier.pop()
 
-        for sy in range(0, h - patch_h + 1, step):
-            for sx in range(0, w - patch_w + 1, step):
-                src_patch = result[sy:sy + patch_h, sx:sx + patch_w]
-                src_known = known_mask[sy:sy + patch_h, sx:sx + patch_w]
-                # 要求"target 已知的像素，source 也已知"
-                if (src_known & target_known).sum() < target_known.sum():
+                # 跳过已处理的像素
+                if work_mask[y, x] == 0:
                     continue
-                diff = src_patch - target_patch
-                ssd = np.sum((diff * target_known[..., np.newaxis]) ** 2)
-                if ssd < best_ssd:
-                    best_ssd = ssd
-                    best_src_y, best_src_x = sy, sx
 
-        if best_src_y is None:
-            # 无合适候选：使用邻域已知像素均值兜底，避免 frontier 无限循环
-            result[y, x] = _neighbor_mean(result, known_mask, y, x)
-            work_mask[y, x] = 0
-            known_mask[y, x] = 1
-        else:
-            # 用最佳匹配填充整个 patch
-            src_patch = result[best_src_y:best_src_y + patch_h,
-                                best_src_x:best_src_x + patch_w]
-            fill_region = (work_mask[y1:y2, x1:x2] > 0)
-            result[y1:y2, x1:x2][fill_region] = src_patch[fill_region]
-            work_mask[y1:y2, x1:x2] = 0
-            known_mask[y1:y2, x1:x2] = 1
+                # 提取待填充块
+                y1, y2 = max(0, y - half_patch), min(h, y + half_patch + 1)
+                x1, x2 = max(0, x - half_patch), min(w, x + half_patch + 1)
+                patch_h, patch_w = y2 - y1, x2 - x1
 
-        # ---------- 扩展 frontier ----------
-        kernel = np.ones((3, 3), np.uint8)
-        unknown_dilated = cv2.dilate(work_mask, kernel, iterations=1)
-        new_frontier_mask = unknown_dilated & (1 - work_mask) & (known_mask == 1)
-        for ny, nx in zip(*np.where(new_frontier_mask > 0)):
-            frontier.add((int(ny), int(nx)))
+                if patch_h != ph or patch_w != ph:
+                    # 边界处无法构成完整块 → 邻域均值填充
+                    _neighbor_fill(result, known_mask, y, x)
+                    work_mask[y, x] = 0
+                    known_mask[y, x] = 1
+                    continue
 
-    # 兜底：剩余 frontier 用邻域均值填充（处理 max_iters 兜底情况）
-    for y, x in frontier:
-        result[y, x] = _neighbor_mean(result, known_mask, y, x)
-        work_mask[y, x] = 0
-        known_mask[y, x] = 1
+                target_patch = result[y1:y2, x1:x2]
+                target_known = known_mask[y1:y2, x1:x2]
+                if not np.any(target_known):
+                    continue
 
-    return result.astype(np.uint8)
+                # ---------- 块匹配搜索 ----------
+                best_ssd = float('inf')
+                best_src_y = best_src_x = None
+
+                for sy in range(0, h - patch_h + 1, step):
+                    for sx in range(0, w - patch_w + 1, step):
+                        src_known = known_mask[sy:sy + patch_h,
+                                                sx:sx + patch_w]
+                        # 要求"target 已知的像素，source 也已知"
+                        if (src_known & target_known).sum() < target_known.sum():
+                            continue
+                        src_patch = result[sy:sy + patch_h, sx:sx + patch_w]
+                        diff = src_patch - target_patch
+                        ssd = np.sum(
+                            (diff * target_known[..., np.newaxis]) ** 2)
+                        if ssd < best_ssd:
+                            best_ssd = ssd
+                            best_src_y, best_src_x = sy, sx
+
+                if best_src_y is None:
+                    # 无合适候选 → 邻域均值填充单像素
+                    _neighbor_fill(result, known_mask, y, x)
+                    work_mask[y, x] = 0
+                    known_mask[y, x] = 1
+                else:
+                    # 用最佳匹配填充整个 patch
+                    src_patch = result[
+                        best_src_y:best_src_y + patch_h,
+                        best_src_x:best_src_x + patch_w]
+                    fill_region = (work_mask[y1:y2, x1:x2] > 0)
+                    if np.any(fill_region):
+                        work_mask_slice = work_mask[y1:y2, x1:x2]
+                        known_slice = known_mask[y1:y2, x1:x2]
+                        result[y1:y2, x1:x2][fill_region] = \
+                            src_patch[fill_region]
+                        work_mask_slice[fill_region] = 0
+                        known_slice[fill_region] = 1
+
+                # ---------- 每 5 次迭代更新一次 frontier ----------
+                frontier_update_counter += 1
+                if frontier_update_counter >= 5:
+                    frontier_update_counter = 0
+                    kernel = np.ones((3, 3), np.uint8)
+                    unknown_dilated = cv2.dilate(work_mask, kernel,
+                                                 iterations=1)
+                    new_frontier_mask = unknown_dilated & (1 - work_mask)
+                    for ny, nx in zip(*np.where(new_frontier_mask > 0)):
+                        frontier.add((int(ny), int(nx)))
+
+            except Exception as e:
+                # 单次迭代出错：跳过该像素，继续处理剩余
+                if y is not None and x is not None and 0 <= y < h and 0 <= x < w:
+                    _neighbor_fill(result, known_mask, y, x)
+                    work_mask[y, x] = 0
+                    known_mask[y, x] = 1
+                continue
+
+        # ----------兜底：处理剩余未填充像素 ----------
+        _fill_remaining(result, known_mask, work_mask)
+
+        small_out = result.astype(np.uint8)
+        return _composite_output(small_out, image, mask, downscaled, h, w)
+
+    except Exception as e:
+        # ---------- 全局异常捕获：任何失败时回退到纯均值填充 ----------
+        import logging
+        logging.warning("纹理合成发生异常(%s)，回退到邻域均值填充", str(e))
+        fallback_img = image.copy()
+        fallback_mask = (mask > 0).astype(np.uint8)
+        result_fb = fallback_img.astype(np.float32)
+        known_fb = (fallback_mask == 0).astype(np.uint8)
+        _fill_remaining(result_fb, known_fb, fallback_mask)
+        return result_fb.astype(np.uint8)
 
 
-def _neighbor_mean(image: np.ndarray, known_mask: np.ndarray,
-                   y: int, x: int) -> np.ndarray:
-    """计算像素 (y, x) 周围 3x3 已知像素的均值（BGR 向量）。"""
+def _neighbor_fill(image: np.ndarray, known_mask: np.ndarray,
+                   y: int, x: int):
+    """将像素(y,x)填充为周围3x3已知像素的均值"""
     h, w = image.shape[:2]
     vals = []
     for dy in (-1, 0, 1):
@@ -263,8 +328,76 @@ def _neighbor_mean(image: np.ndarray, known_mask: np.ndarray,
             if 0 <= ny < h and 0 <= nx < w and known_mask[ny, nx]:
                 vals.append(image[ny, nx])
     if vals:
-        return np.mean(vals, axis=0)
-    return image[y, x]  # 全部未知时保留原值
+        image[y, x] = np.mean(vals, axis=0)
+    # 无已知邻域时保持原值
+
+
+def _fill_remaining(result: np.ndarray, known_mask: np.ndarray,
+                    work_mask: np.ndarray):
+    """用邻域均值填充 work_mask 中剩余的未处理像素
+
+    Args:
+        result: 当前结果图像 (float32, 会被就地修改)
+        known_mask: 已知区域掩码 (uint8, 会被就地修改)
+        work_mask: 待填充掩码 (uint8, 会被就地修改)
+    """
+    h, w = result.shape[:2]
+    frontier = set(zip(*np.where(work_mask > 0)))
+    max_iters = min(10000, len(frontier) * 2)
+    iters = 0
+    while frontier and iters < max_iters:
+        iters += 1
+        y, x = frontier.pop()
+        if work_mask[y, x] == 0:
+            continue
+        _neighbor_fill(result, known_mask, y, x)
+        work_mask[y, x] = 0
+        known_mask[y, x] = 1
+        # 加入新暴露的边界像素
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and work_mask[ny, nx] > 0:
+                    frontier.add((ny, nx))
+    # 仍然剩余？逐个处理
+    for y, x in frontier:
+        if work_mask[y, x] > 0:
+            _neighbor_fill(result, known_mask, y, x)
+            work_mask[y, x] = 0
+
+
+def _composite_output(small_result: np.ndarray,
+                      original_image: np.ndarray,
+                      original_mask: np.ndarray,
+                      downscaled: bool,
+                      small_h: int, small_w: int) -> np.ndarray:
+    """将处理结果（可能在小尺寸上运行）合成回原始图像
+
+    防止核心问题：降采样处理后对整个图像升采样，导致非 mask 区也被模糊。
+
+    策略：
+    - 非降采样路径：直接返回 small_result（已在原始分辨率上处理）
+    - 降采样路径：将 small_result 升采样到原始尺寸后，**仅把 mask 区域**
+      从升采样结果中拷贝到原始图像副本上，非 mask 区域保持原始像素
+    """
+    if not downscaled:
+        # 图像未降采样，直接返回（已在原始分辨率上处理完毕）
+        return small_result
+
+    h_orig, w_orig = original_image.shape[:2]
+
+    # 1. 将小尺寸处理结果升采样到原始尺寸
+    upsampled = cv2.resize(small_result, (w_orig, h_orig),
+                           interpolation=cv2.INTER_LINEAR)
+
+    # 2. 从原始图像复制一份，作为底图
+    final = original_image.copy()
+
+    # 3. 仅替换 mask 区域像素（mask > 0 的位置）
+    #    原始 mask 坐标直接对应到升采样后的结果
+    final[original_mask > 0] = upsampled[original_mask > 0]
+
+    return final
 
 
 def ai_repair(image: np.ndarray, mask: np.ndarray,
