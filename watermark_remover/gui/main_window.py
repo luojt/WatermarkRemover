@@ -40,7 +40,7 @@ from ..core.algorithms import AlgorithmType, get_algorithms
 from ..core.image_processor import ImageProcessor
 from ..utils.helpers import (
     generate_output_path, ensure_output_dir, is_image_file,
-    format_file_size, limit_image_size, resource_path
+    format_file_size, resource_path
 )
 from .styles import get_style
 from .theme import get_manager, ThemeMode, ThemePalette
@@ -118,19 +118,29 @@ class DropArea(QWidget):
         if hasattr(self, '_icon_label'):
             self._icon_label.setPixmap(get_pixmap(IconName.FOLDER, size=64))
 
+    def _apply_hover_state(self):
+        """刷新 hover 动态属性（QSS 中通过 DropArea[hover="true"] 选择器使用）
+
+        Qt 动态属性必须显式设置并 unpolish/polish 后才会重新匹配样式表。
+        """
+        self.setProperty("hover", bool(self._hover))
+        # 重新 polish 让样式表重新解析
+        self.style().unpolish(self)
+        self.style().polish(self)
+
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             self._hover = True
             event.acceptProposedAction()
-            self._refresh_style()
+            self._apply_hover_state()
 
     def dragLeaveEvent(self, event):
         self._hover = False
-        self._refresh_style()
+        self._apply_hover_state()
 
     def dropEvent(self, event: QDropEvent):
         self._hover = False
-        self._refresh_style()
+        self._apply_hover_state()
 
         files = []
         for url in event.mimeData().urls():
@@ -212,9 +222,19 @@ class ImageViewer(QWidget):
         self.update()
 
     def set_pixmap(self, pixmap: Optional[QPixmap]):
-        """设置显示的图像，自动适配可视区域"""
+        """设置显示的图像，自动适配可视区域
+
+        默认会清空已绘制的选区。如果要在更新图像后仍保留选区
+        （如去水印后想继续看到水印位置），传入 ``keep_selections=True``。
+        """
         self._pixmap = pixmap.copy() if pixmap else None
         self._selections.clear()
+        self._auto_fit()
+        self.update()
+
+    def update_pixmap(self, pixmap: Optional[QPixmap]):
+        """仅更新图像内容，保留选区"""
+        self._pixmap = pixmap.copy() if pixmap else None
         self._auto_fit()
         self.update()
 
@@ -949,13 +969,16 @@ class BatchProcessor(QThread):
 
     def __init__(self, files: List[str], output_dir: str,
                  algorithm: AlgorithmType, mask: np.ndarray = None,
-                 quality: int = 95, **kwargs):
+                 quality: int = 95, suffix: str = "_processed",
+                 include_date: bool = False, **kwargs):
         super().__init__()
         self._files = files
         self._output_dir = output_dir
         self._algorithm = algorithm
         self._mask = mask
         self._quality = quality
+        self._suffix = suffix
+        self._include_date = include_date
         self._kwargs = kwargs
         self._is_running = True
 
@@ -985,7 +1008,8 @@ class BatchProcessor(QThread):
                 # 应用算法
                 mask = self._mask
                 output_path = generate_output_path(
-                    self._output_dir, file_path)
+                    self._output_dir, file_path,
+                    self._suffix, self._include_date)
 
                 if mask is not None:
                     result = processor.apply_algorithm_to_image(
@@ -993,19 +1017,9 @@ class BatchProcessor(QThread):
                 else:
                     result = img.copy()
 
-                # 保存
-                if self._quality > 0:
-                    ext = os.path.splitext(output_path)[1].lower()
-                    if ext in ['.jpg', '.jpeg']:
-                        cv2.imwrite(output_path, result,
-                                    [cv2.IMWRITE_JPEG_QUALITY, self._quality])
-                    elif ext == '.png':
-                        cv2.imwrite(output_path, result,
-                                    [cv2.IMWRITE_PNG_COMPRESSION, 3])
-                    else:
-                        cv2.imwrite(output_path, result)
-                else:
-                    cv2.imwrite(output_path, result)
+                # 保存（复用 ImageProcessor.save_image 以保证 PNG/JPEG 压缩参数一致）
+                if not ImageProcessor.save_image(result, output_path, self._quality):
+                    raise IOError(f"cv2.imwrite 未能生成文件: {output_path}")
 
                 if os.path.exists(output_path):
                     success += 1
@@ -1165,6 +1179,7 @@ class BatchDialog(QDialog):
         algorithm = AlgorithmType.INPAINT_TELEA
         mask = None
         quality = self._quality_spin.value()
+        kwargs = {}
 
         if hasattr(main_window, '_processor'):
             proc = main_window._processor
@@ -1176,9 +1191,28 @@ class BatchDialog(QDialog):
                     algorithm = algo
                     break
 
+        # 透传算法特定参数
+        if algorithm == AlgorithmType.AREA_COVER and hasattr(
+                main_window, '_cover_method_combo'):
+            kwargs['method'] = main_window._cover_method_combo.currentText()
+        elif algorithm == AlgorithmType.AI_REPAIR and hasattr(
+                main_window, '_strength_spin'):
+            kwargs['strength'] = main_window._strength_spin.value()
+
+        # 文件命名配置（与主界面保存一致）
+        suffix = "_processed"
+        include_date = False
+        if hasattr(main_window, '_suffix_edit'):
+            text = main_window._suffix_edit.text().strip()
+            if text:
+                suffix = text
+        if hasattr(main_window, '_include_date_cb'):
+            include_date = main_window._include_date_cb.isChecked()
+
         # 创建并启动处理线程
         self._processor = BatchProcessor(
-            self._files, output_dir, algorithm, mask, quality
+            self._files, output_dir, algorithm, mask, quality,
+            suffix=suffix, include_date=include_date, **kwargs,
         )
         self._processor.progress_updated.connect(self._on_progress)
         self._processor.processing_complete.connect(self._on_complete)
@@ -1219,6 +1253,14 @@ class BatchDialog(QDialog):
             )
             if reply == QMessageBox.Yes:
                 self._processor.stop()
+                # 先断开信号，避免 wait() 后仍有信号触发到即将销毁的对话框
+                for sig in (self._processor.progress_updated,
+                            self._processor.file_processed,
+                            self._processor.processing_complete):
+                    try:
+                        sig.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
                 self._processor.wait()
                 event.accept()
             else:
@@ -1238,6 +1280,10 @@ class MainWindow(QMainWindow):
         self._current_pixmap: Optional[QPixmap] = None
         self._result_pixmap: Optional[QPixmap] = None
         self._is_comparing = False
+
+        # 标识下次 _refresh_preview 是"整体替换图片"（加载/重置）还是
+        # "算法结果更新"（仅刷新像素、保留选区）
+        self._is_replacing_image = False
 
         self._setup_ui()
         self._setup_menu()
@@ -1457,8 +1503,8 @@ class MainWindow(QMainWindow):
         self._quality_spin.setSuffix("%")
         save_layout.addWidget(self._quality_spin, 2, 1)
 
-        include_date_cb = QCheckBox("文件名包含日期")
-        save_layout.addWidget(include_date_cb, 2, 2)
+        self._include_date_cb = QCheckBox("文件名包含日期")
+        save_layout.addWidget(self._include_date_cb, 2, 2)
 
         output_layout.addWidget(save_group)
 
@@ -1651,6 +1697,8 @@ class MainWindow(QMainWindow):
         """图像状态变更回调"""
         self._update_ui_state()
         self._refresh_preview()
+        # 一次性标志：用完后重置，避免影响后续"算法结果"刷新
+        self._is_replacing_image = False
 
     def _refresh_preview(self):
         """刷新预览"""
@@ -1660,7 +1708,13 @@ class MainWindow(QMainWindow):
                 ImageProcessor.image_to_qimage(img)
             )
             self._current_pixmap = pixmap
-            self._image_viewer.set_pixmap(pixmap)
+            # 区分"首次加载/重置"和"算法结果刷新"：
+            # - 首次加载与重置：清空选区（图片已整体更换）
+            # - 算法结果：保留选区叠加，便于查看水印位置
+            if self._is_replacing_image:
+                self._image_viewer.set_pixmap(pixmap)
+            else:
+                self._image_viewer.update_pixmap(pixmap)
 
             # 更新状态信息
             h, w = img.shape[:2]
@@ -1743,6 +1797,7 @@ class MainWindow(QMainWindow):
     def _load_image(self, file_path: str):
         """加载图片"""
         if self._processor.load_image(file_path):
+            self._is_replacing_image = True
             self._status_label.setText(f"已加载: {os.path.basename(file_path)}")
             # 恢复选择模式
             self._image_viewer.set_mode(ImageViewer.MODE_SELECT)
@@ -1809,6 +1864,7 @@ class MainWindow(QMainWindow):
             QMessageBox.No
         )
         if reply == QMessageBox.Yes:
+            self._is_replacing_image = True
             self._processor.reset_to_original()
             self._clear_selections()
             self._status_label.setText("已重置为原始图像")
@@ -1848,7 +1904,10 @@ class MainWindow(QMainWindow):
             output_dir = os.path.dirname(original_path)
 
         suffix = self._suffix_edit.text().strip() or "_nwm"
-        output_path = generate_output_path(output_dir, original_path, suffix)
+        output_path = generate_output_path(
+            output_dir, original_path, suffix,
+            include_date=self._include_date_cb.isChecked(),
+        )
 
         quality = self._quality_spin.value()
         if ImageProcessor.save_image(current, output_path, quality):

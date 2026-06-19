@@ -131,10 +131,18 @@ class ImageProcessor:
         self._notify()
 
     def reset_to_original(self):
-        """重置为原始图像"""
+        """重置为原始图像
+
+        重置后丢弃此前所有的处理历史，仅保留"加载图像"和"重置"两条记录，
+        这样 undo 不会回退到上一次的算法结果（语义上"重置"不可逆）。
+        """
         if self._original_image is not None:
             self._current_image = self._original_image.copy()
             self._mask = None
+            # 截断历史：保留最初"加载图像"记录（如有），避免 undo 回到处理中间态
+            if self._history:
+                self._history = self._history[:1]
+            self._history_index = len(self._history) - 1
             self._save_state("重置为原始图像")
             self._notify()
 
@@ -266,7 +274,9 @@ class ImageProcessor:
         Args:
             image: 要保存的图像 (BGR格式)
             save_path: 保存路径
-            quality: JPEG质量 (1-100)
+            quality: 质量参数 (1-100)。
+                - JPEG：直接作为质量等级 (IMWRITE_JPEG_QUALITY)
+                - PNG：将 100→0 映射为压缩等级 0（无损）→ 9（最大压缩）
 
         Returns:
             是否成功保存
@@ -276,10 +286,14 @@ class ImageProcessor:
 
             if ext in ['.jpg', '.jpeg']:
                 cv2.imwrite(save_path, image,
-                            [cv2.IMWRITE_JPEG_QUALITY, quality])
+                            [cv2.IMWRITE_JPEG_QUALITY,
+                             max(1, min(100, int(quality)))])
             elif ext == '.png':
+                # quality 越大 → 压缩等级越小（文件越大、画质越好）
+                clamped = max(1, min(100, int(quality)))
+                png_compress = max(0, min(9, 9 - (clamped * 9 // 100)))
                 cv2.imwrite(save_path, image,
-                            [cv2.IMWRITE_PNG_COMPRESSION, 3])
+                            [cv2.IMWRITE_PNG_COMPRESSION, png_compress])
             else:
                 cv2.imwrite(save_path, image)
 
@@ -308,7 +322,7 @@ class ImageProcessor:
 
     @staticmethod
     def qimage_to_cvmat(qimage):
-        """将QImage转换为OpenCV图像"""
+        """将QImage转换为OpenCV图像（BGR）"""
         from PyQt5.QtGui import QImage
 
         if qimage.isNull():
@@ -319,9 +333,8 @@ class ImageProcessor:
 
         # 转换为RGBA格式以便处理
         qimage = qimage.convertToFormat(QImage.Format_RGBA8888)
+        # PyQt5 在 Python 3 下 qimage.bits() 返回 memoryview，无需 setsize
         ptr = qimage.bits()
-        ptr.setsize(height * width * 4)
-        arr = np.array(ptr).reshape(height, width, 4)
-
-        # RGBA -> BGR
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(
+            (height, width, 4)).copy()
         return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
