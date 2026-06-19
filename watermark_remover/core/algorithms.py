@@ -15,6 +15,7 @@ class AlgorithmType(Enum):
     AREA_COVER = "区域覆盖"
     TEXTURE_SYNTHESIS = "纹理合成"
     AI_REPAIR = "AI 智能修复"
+    FFT_REMOVAL = "频域滤波 (FFT)"
 
 
 def get_algorithms():
@@ -454,6 +455,209 @@ def ai_repair(image: np.ndarray, mask: np.ndarray,
     return result
 
 
+def fft_watermark_removal(image: np.ndarray, mask: np.ndarray = None,
+                          threshold_percentile: float = None,
+                          guard_band_radius: int = 5) -> np.ndarray:
+    """
+    频域滤波去水印 — 专杀周期性/网格状/规律排列的水印
+
+    原理：
+      规律水印在图像的傅里叶频谱中表现为孤立的异常高亮点（峰值）。
+      本算法使用高通预滤波去除图像低频内容的干扰，然后通过
+      径向谐波聚类检测来定位水印频率峰值并抑制它们（带阻滤波），
+      最后逆变换还原图像。对随机/不规则水印无效。
+
+      使用径向谐波聚类检测：水印频率峰值集中在特定半径的谐波序列上
+      （如 d, 2d, 3d, ...），而自然图像纹理的峰值在相邻半径上连续分布。
+      这能有效区分周期性水印和自然图像纹理。
+
+    Args:
+        image: 输入图像 (BGR格式, uint8)
+        mask: 可选二值掩码 (白色区域=水印，用于限制处理区域)
+        threshold_percentile: 频域峰值检测阈值百分位（默认自动选择：
+                              有 mask 时 99.0%，无 mask 时 99.9%）
+        guard_band_radius: 保护带半径，排除频域中心低频区域（默认 5px）
+
+    Returns:
+        处理后的图像 (BGR格式, uint8)
+    """
+    h, w = image.shape[:2]
+
+    # 如果提供了 mask，将处理范围限制在 mask 区域外扩的矩形内
+    if mask is not None and np.any(mask > 0):
+        ys, xs = np.where(mask > 0)
+        y1, y2 = max(0, ys.min() - 10), min(h, ys.max() + 10)
+        x1, x2 = max(0, xs.min() - 10), min(w, xs.max() + 10)
+        roi = image[y1:y2, x1:x2]
+    else:
+        roi = image
+        y1 = x1 = 0
+
+    # 转为灰度
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # ---- 高通预滤波：去除图像低频内容对 FFT 的干扰 ----
+    # 使用大核高斯模糊作为低通估计，减去后保留高频细节（网格/水印）
+    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=15.0)
+    highpass = gray - blurred
+
+    # ---- 对高通结果做 FFT 用于峰值检测 ----
+    f_hp = np.fft.fft2(highpass)
+    fshift_hp = np.fft.fftshift(f_hp)
+    magnitude_hp = np.log(np.abs(fshift_hp) + 1e-8)
+
+    # ---- 对原图做 FFT 用于实际滤波 ----
+    f = np.fft.fft2(gray)
+    fshift = np.fft.fftshift(f)
+
+    rows, cols = gray.shape
+    crow, ccol = rows // 2, cols // 2
+
+    # ---- 峰值检测掩码：仅用于排除频域中心被误检为水印频率 ----
+    detect_mask = np.ones_like(gray, dtype=np.uint8)
+    detect_mask[crow - guard_band_radius:crow + guard_band_radius + 1,
+                ccol - guard_band_radius:ccol + guard_band_radius + 1] = 0
+
+    # ---- 频域滤波掩码：初始全部保留 ----
+    freq_mask = np.ones_like(gray, dtype=np.uint8)
+
+    # 自适应阈值：有 mask 时更激进，无 mask 时极度保守
+    if threshold_percentile is None:
+        if mask is not None and np.any(mask > 0):
+            threshold_percentile = 99.5
+        else:
+            threshold_percentile = 99.9
+
+    # 1. 全局阈值：在高通滤波频谱中检测候选峰值
+    global_threshold = np.percentile(magnitude_hp[detect_mask > 0],
+                                     threshold_percentile)
+    candidate_peaks = magnitude_hp > global_threshold
+
+    # 2. 安全阀：如果候选峰值太少，跳过处理
+    num_candidates = candidate_peaks.sum()
+    if num_candidates < 2:
+        return image
+
+    # 3. 径向谐波聚类检测
+    #    水印产生的频率峰值集中在特定半径的谐波序列上（如 d, 2d, 3d, ...）
+    #    自然图像的频率峰值在各个半径上均匀或连续分布
+    yy, xx = np.where(candidate_peaks & (detect_mask > 0))
+    distances = np.sqrt((yy - crow) ** 2 + (xx - ccol) ** 2).astype(int)
+
+    # 统计各半径的峰值数量
+    unique_dists, counts = np.unique(distances, return_counts=True)
+
+    # 尝试不同的基频候选，计算最佳谐波聚类
+    # 候选基频：所有距离的因子，范围 5 ~ min(rows, cols)//4
+    def _get_divisors_in_range(n, lo=5, hi=None):
+        """返回 n 在 [lo, hi] 范围内的因子"""
+        if hi is None:
+            hi = min(rows, cols) // 4
+        divisors = set()
+        for i in range(1, int(n ** 0.5) + 1):
+            if n % i == 0:
+                if lo <= i <= hi:
+                    divisors.add(i)
+                other = n // i
+                if lo <= other <= hi:
+                    divisors.add(other)
+        return sorted(divisors) if divisors else [lo]
+
+    # 收集所有候选基频
+    base_candidates = set()
+    for d in unique_dists:
+        for b in _get_divisors_in_range(d):
+            base_candidates.add(b)
+    base_candidates = sorted(base_candidates)
+
+    best_base = None
+    best_harmonic_count = 0
+    best_harmonic_ratio = 0.0
+    tolerance = int(max(2, min(rows, cols) * 0.01))  # 1% 容差
+
+    for base in base_candidates:
+        # 将距离按基频的整数倍分组，计算所有谐波半径上的总峰值占比
+        harmonic_total = 0.0
+        for d, cnt in zip(unique_dists, counts):
+            # 计算 d 最近的基频倍数
+            nearest_mult = int(round(d / base))
+            if nearest_mult < 1:
+                nearest_mult = 1
+            target = nearest_mult * base
+            if abs(d - target) <= tolerance:
+                harmonic_total += cnt
+
+        ratio = harmonic_total / num_candidates
+
+        if ratio > best_harmonic_ratio:
+            best_harmonic_ratio = ratio
+            best_harmonic_count = int(harmonic_total)
+            best_base = base
+
+    # 限制最小基频，排除近中心低频纹理（必须有实际意义的网格频率）
+    min_base = max(5, min(rows, cols) // 20)
+    valid_bases = []
+    for base in base_candidates:
+        if base < min_base:
+            continue
+        harmonic_total = 0.0
+        for d, cnt in zip(unique_dists, counts):
+            nearest_mult = int(round(d / base))
+            if nearest_mult < 1:
+                nearest_mult = 1
+            target = nearest_mult * base
+            if abs(d - target) <= tolerance:
+                harmonic_total += cnt
+        ratio = harmonic_total / num_candidates
+        if ratio >= 0.4:
+            valid_bases.append((ratio, base))
+
+    if valid_bases:
+        best_harmonic_ratio, best_base = max(valid_bases, key=lambda x: x[0])
+    else:
+        return image
+
+    # 对于无 mask 的全图模式，不做滤波（只在 mask 指定的区域操作）
+    if mask is None or not np.any(mask > 0):
+        return image
+
+    # 4. 使用检测到的峰值坐标，在**原图 FFT** 上进行滤波
+    for d, py, px in zip(distances, yy, xx):
+        nearest_mult = int(round(d / best_base))
+        if nearest_mult < 1:
+            nearest_mult = 1
+        target = nearest_mult * best_base
+        if abs(d - target) <= tolerance:
+            freq_mask[py, px] = 0
+
+    # 对频域掩码做轻微腐蚀，扩大去除范围（类似 notch filter 的带宽）
+    kernel = np.ones((3, 3), np.uint8)
+    freq_mask = cv2.erode(freq_mask, kernel, iterations=1)
+
+    # 应用频域滤波（带阻）
+    fshift_filtered = fshift * freq_mask.astype(np.float32)
+
+    # 逆变换
+    f_ishift = np.fft.ifftshift(fshift_filtered)
+    result_gray = np.fft.ifft2(f_ishift)
+    result_gray = np.clip(np.abs(result_gray), 0, 255).astype(np.uint8)
+
+    # 转为 BGR
+    result = cv2.cvtColor(result_gray, cv2.COLOR_GRAY2BGR)
+
+    # 如果有 mask 区域限制，将处理结果拼回原图（仅替换水印区域）
+    if mask is not None and np.any(mask > 0):
+        final = image.copy()
+        roi_mask = mask[y1:y2, x1:x2]
+        if np.any(roi_mask > 0):
+            final_roi = final[y1:y2, x1:x2]
+            final_roi[roi_mask > 0] = result[roi_mask > 0]
+            final[y1:y2, x1:x2] = final_roi
+        return final
+
+    return result
+
+
 # 算法映射表
 ALGORITHM_MAP = {
     AlgorithmType.INPAINT_TELEA: inpaint_telea,
@@ -461,4 +665,5 @@ ALGORITHM_MAP = {
     AlgorithmType.AREA_COVER: area_cover,
     AlgorithmType.TEXTURE_SYNTHESIS: texture_synthesis,
     AlgorithmType.AI_REPAIR: ai_repair,
+    AlgorithmType.FFT_REMOVAL: fft_watermark_removal,
 }
